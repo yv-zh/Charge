@@ -1120,7 +1120,7 @@ with tab_holidays:
             deadlines_map=deadlines_map,
         )
 
-        components.html(html, height=1850, scrolling=True)
+        components.html(html, height=1450, scrolling=True)
 
 # --------------------------
 # Week view
