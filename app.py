@@ -574,7 +574,44 @@ def make_week_grid_html(
 # ============================================================
 st.set_page_config(page_title="Mini-Planyway", layout="wide")
 
-st.title("🗓️ Mini planification équipe")
+if "sb_open" not in st.session_state:
+    st.session_state["sb_open"] = True
+
+st.markdown(
+    f"""
+    <style>
+      /* Cache le chevron natif */
+      [data-testid="stSidebarCollapsedControl"] {{
+        display: none !important;
+      }}
+
+      /* Cache Deploy + ⋮ */
+      [data-testid="stToolbar"] {{
+        display: none !important;
+      }}
+      #MainMenu {{
+        visibility: hidden;
+      }}
+
+      /* Cache la sidebar quand fermée */
+      {"[data-testid='stSidebar']{display:none !important;}" if not st.session_state["sb_open"] else ""}
+      {"section[data-testid='stSidebar']{display:none !important;}" if not st.session_state["sb_open"] else ""}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+c1, c2 = st.columns([1, 12], vertical_alignment="center")
+
+with c1:
+    if st.button("☰" if not st.session_state["sb_open"] else "✕", key="toggle_sb"):
+        st.session_state["sb_open"] = not st.session_state["sb_open"]
+        st.rerun()
+
+with c2:
+    st.title("🗓️ Mini planification équipe")
+
+
 st.caption("• 1 onglet Config global • 1 onglet tâches + 1 onglet absence par personne • ")
 
 # Sidebar: Source + Person only (no macro knobs)
