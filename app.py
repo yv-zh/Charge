@@ -576,11 +576,15 @@ st.set_page_config(page_title="Mini-Planyway", layout="wide")
 st.markdown(
     """
     <style>
-    /* Cache la toolbar / header Streamlit (peut changer selon versions) */
-    [data-testid="stToolbar"] { display: none !important; }
-    header[data-testid="stHeader"] { display: none !important; }
-    /* Si une barre résiduelle reste */
-    .stApp > header { display: none !important; }
+    /* Cache le menu / toolbar Streamlit */
+    [data-testid="stToolbar"] {
+        display: none !important;
+    }
+
+    /* Cache le footer */
+    footer {
+        visibility: hidden;
+    }
     </style>
     """,
     unsafe_allow_html=True,
