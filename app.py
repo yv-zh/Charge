@@ -19,7 +19,7 @@ import streamlit as st
 # - Structure Excel (human readable):
 #     Sheet "Config"                 (global) + column people="Alice,Bob"
 #     Sheet "{Prenom}"               tasks for that person
-#     Sheet "{Prenom}__holidays"     holidays for that person
+#     Sheet "{Prenom}_absence"       absences for that person
 # - App is READ-ONLY vs SharePoint
 # - No simulation UI: macro params come from Config only
 # ============================================================
@@ -38,10 +38,9 @@ HOLIDAY_COLOR = "#B0B0B0"  # gris
 
 # ⚠️ Remplace par ton endpoint si besoin
 PA_ENDPOINT = (
-        st.secrets.get("PA_ENDPOINT", "")
-        if hasattr(st, "secrets")
-        else ""
-    ) or os.environ.get("PA_ENDPOINT", "")
+    (st.secrets.get("PA_ENDPOINT", "") if hasattr(st, "secrets") else "")
+    or os.environ.get("PA_ENDPOINT", "")
+)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_excel_from_power_automate(url: str) -> bytes:
@@ -146,6 +145,7 @@ def parse_weekdays_list(s: str) -> Optional[Set[int]]:
             pass
 
     return out if out else None
+
 
 # ============================================================
 # Normalization Config / Tasks / Holidays
@@ -526,11 +526,12 @@ def make_week_grid_html(
     if not p.empty:
         p["label"] = p.apply(lambda r: f"{r['project']} • {r['task']}", axis=1)
 
+    # NOTE: start_from est une variable globale (définie plus bas dans l'UI)
     min_day = start_from
     if not p.empty:
         min_day = min(p["date"].min(), start_from)
 
-    week0 = week0 = iso_week_start(anchor_day)
+    week0 = iso_week_start(anchor_day)
     week_starts = [week0 + timedelta(days=7 * i) for i in range(weeks)]
 
     cols = []
@@ -572,59 +573,44 @@ def make_week_grid_html(
 # ============================================================
 # Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Mini-Planyway", layout="wide")
-
-if "sb_open" not in st.session_state:
-    st.session_state["sb_open"] = True
-
+st.set_page_config(page_title="Mini-Planyway", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(
-    f"""
+    """
     <style>
-      /* Cache le chevron natif */
-      [data-testid="stSidebarCollapsedControl"] {{
-        display: none !important;
-      }}
+    /* 🔽 Réduit l’espace vide au-dessus du contenu */
+    .block-container {
+        padding-top: 1.2rem !important;
+    }
 
-      /* Cache Deploy + ⋮ */
-      [data-testid="stToolbar"] {{
-        display: none !important;
-      }}
-      #MainMenu {{
+    /* 🔽 Réduit l’espace entre le titre et le reste */
+    h1 {
+        margin-bottom: 0.3rem !important;
+    }
+
+    /* 🔽 Cache la top bar (Deploy, menu ⋮) */
+    header {
         visibility: hidden;
-      }}
+        height: 0px;
+    }
 
-      /* Cache la sidebar quand fermée */
-      {"[data-testid='stSidebar']{display:none !important;}" if not st.session_state["sb_open"] else ""}
-      {"section[data-testid='stSidebar']{display:none !important;}" if not st.session_state["sb_open"] else ""}
+    /* 🔽 Supprime l’espace réservé par la top bar */
+    [data-testid="stToolbar"] {
+        display: none;
+    }
     </style>
     """,
-    unsafe_allow_html=True,
+    unsafe_allow_html=True
 )
 
-c1, c2 = st.columns([1, 12], vertical_alignment="center")
 
-with c1:
-    if st.button("☰" if not st.session_state["sb_open"] else "✕", key="toggle_sb"):
-        st.session_state["sb_open"] = not st.session_state["sb_open"]
-        st.rerun()
+st.title("🗓️ Mini planification équipe")
 
-with c2:
-    st.title("🗓️ Mini planification équipe")
-
-
-st.caption("• 1 onglet Config global • 1 onglet tâches + 1 onglet absence par personne • ")
-
-# Sidebar: Source + Person only (no macro knobs)
-st.sidebar.header("🔌 Source automatique")
+# Endpoint check
 if not PA_ENDPOINT:
-    st.sidebar.error("PA_ENDPOINT manquant.")
+    st.error("PA_ENDPOINT manquant.")
     st.stop()
 
-if st.sidebar.button("🔄 Rafraîchir la source"):
-    st.cache_data.clear()
-    st.rerun()
-
-# fetch excel
+# ---- Fetch excel (d'abord), puis on affiche les contrôles 1 seule fois
 try:
     xlsx_bytes = fetch_excel_from_power_automate(PA_ENDPOINT)
     xls = open_xls_bytes(xlsx_bytes)
@@ -644,17 +630,29 @@ if not people:
     st.error("Aucune personne détectée. Renseigne Config.people='Alice,Bob' ou crée des onglets prénom.")
     st.stop()
 
-st.sidebar.divider()
-st.sidebar.header("👤 Personne")
-if "person" not in st.session_state:
+# session person init
+if "person" not in st.session_state or st.session_state["person"] not in people:
     st.session_state["person"] = people[0]
 
-person = st.sidebar.selectbox(
-    "Prénom",
-    options=people,
-    index=people.index(st.session_state["person"]) if st.session_state["person"] in people else 0,
-)
-st.session_state["person"] = person
+with st.expander("⚙️ Contrôles", expanded=True):
+    c_left, c_right = st.columns([1, 1], vertical_alignment="center")
+
+    with c_left:
+        if st.button("🔄 Rafraîchir la source", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    with c_right:
+        person = st.selectbox(
+            "Personne",
+            options=people,
+            index=people.index(st.session_state["person"]),
+            key="person_select",
+            label_visibility="collapsed",
+        )
+        st.session_state["person"] = person
+
+person = st.session_state["person"]
 
 # Load person sheets
 tasks = normalize_tasks(read_sheet(xls, person))
@@ -694,7 +692,6 @@ tab_tasks, tab_holidays, tab_week, tab_gantt = st.tabs(
 # --------------------------
 with tab_tasks:
     st.subheader(f"Tâches — {person}")
-    st.info("Lecture seule (source SharePoint).")
 
     with st.expander("🔎 Filtres tâches", expanded=False):
         c0, c1, c2, c3 = st.columns([2, 2, 2, 2])
@@ -761,7 +758,6 @@ with tab_tasks:
 # --------------------------
 with tab_holidays:
     st.subheader(f"Congés / Formations — {person}")
-    st.info("Lecture seule (source SharePoint).")
 
     st.dataframe(
         holidays if not holidays.empty else pd.DataFrame(columns=["date", "slot", "label"]),
