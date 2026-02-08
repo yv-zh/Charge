@@ -573,23 +573,6 @@ def make_week_grid_html(
 # Streamlit UI
 # ============================================================
 st.set_page_config(page_title="Mini-Planyway", layout="wide")
-st.markdown(
-    """
-    <style>
-    /* Cache le menu / toolbar Streamlit */
-    [data-testid="stToolbar"] {
-        display: none !important;
-    }
-
-    /* Cache le footer */
-    footer {
-        visibility: hidden;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 
 st.title("🗓️ Mini planification équipe")
 st.caption("• 1 onglet Config global • 1 onglet tâches + 1 onglet absence par personne • ")
