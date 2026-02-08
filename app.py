@@ -1,17 +1,19 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import date, timedelta
 from io import BytesIO
 from typing import Dict, List, Optional, Set, Tuple
 import base64
+import calendar
+import hashlib
 import json
 import os
-
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+
 
 # ============================================================
 # ✅ Mini-Planyway macro (TEAM / SharePoint via Power Automate)
@@ -36,11 +38,15 @@ MODES = ["BLOCK", "SMOOTH", "FOCUS"]
 HOLIDAY_SERIES_NAME = "Holiday"
 HOLIDAY_COLOR = "#B0B0B0"  # gris
 
-# ⚠️ Remplace par ton endpoint si besoin
 PA_ENDPOINT = (
     (st.secrets.get("PA_ENDPOINT", "") if hasattr(st, "secrets") else "")
     or os.environ.get("PA_ENDPOINT", "")
 )
+
+
+# ============================================================
+# Fetch XLSX
+# ============================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_excel_from_power_automate(url: str) -> bytes:
@@ -77,6 +83,7 @@ def read_sheet(xls: pd.ExcelFile, name: str) -> pd.DataFrame:
 # ============================================================
 # Date + parsing helpers
 # ============================================================
+
 def normalize_date(x) -> Optional[date]:
     if x is None or pd.isna(x):
         return None
@@ -150,13 +157,14 @@ def parse_weekdays_list(s: str) -> Optional[Set[int]]:
 # ============================================================
 # Normalization Config / Tasks / Holidays
 # ============================================================
+
 def normalize_config(cfg: pd.DataFrame) -> pd.DataFrame:
     defaults = {
-        "workdays": "0,1,2,3,4",
+        "workdays": "1,2,3,4,5",  # Lun..Ven (format UI 1..7)
         "start_from": "",
         "smooth_max_slots_per_day": 1,
         "focus_only_day": 0,
-        "smooth_weekdays_default": "0,1,2,3,4",
+        "smooth_weekdays_default": "1,2,3,4,5",
         "project_colors": "",
         "people": "",
     }
@@ -189,7 +197,7 @@ def get_people(cfg: pd.DataFrame, xls: pd.ExcelFile) -> List[str]:
             continue
         if s.endswith(HOL_SUFFIX):
             continue
-        if "__" in s:
+        if "_" in s:
             continue
         out.append(s)
     return sorted(out)
@@ -254,17 +262,349 @@ def normalize_holidays(hol: pd.DataFrame) -> pd.DataFrame:
             hol[c] = ""
 
     hol["date"] = hol["date"].apply(normalize_date)
-    hol["slot"] = hol["slot"].fillna("").astype(str).str.upper()
-    hol.loc[~hol["slot"].isin(SLOT_LABELS), "slot"] = "AM"
-    hol["label"] = hol["label"].fillna("").astype(str)
+
+    # ✅ IMPORTANT: on conserve "" pour "journée complète"
+    hol["slot"] = hol["slot"].fillna("").astype(str).str.strip().str.upper()
+
+    # ✅ on ne corrige en AM que si slot est non vide ET invalide
+    mask_invalid_non_empty = (hol["slot"] != "") & (~hol["slot"].isin(SLOT_LABELS))
+    hol.loc[mask_invalid_non_empty, "slot"] = "AM"
+
+    hol["label"] = hol["label"].fillna("").astype(str).str.strip()
+    hol.loc[hol["label"] == "", "label"] = "OFF"
 
     hol = hol.dropna(subset=["date"]).drop_duplicates(subset=["date", "slot"]).sort_values(["date", "slot"])
     return hol[["date", "slot", "label"]].copy()
 
 
 # ============================================================
-# Colors + HTML helpers
+# Absences: color per label + annual calendar (label in cell)
 # ============================================================
+def build_deadlines_map(tasks_df: pd.DataFrame, only_todo: bool = True) -> Dict[date, List[str]]:
+    """
+    Retourne {date_deadline: ["[P1] Projet — Tâche", ...]}
+    """
+    if tasks_df is None or tasks_df.empty:
+        return {}
+
+    df = tasks_df.copy()
+    if only_todo and "status" in df.columns:
+        df = df[df["status"] != "Done"]
+
+    df = df.dropna(subset=["deadline"]).copy()
+    out: Dict[date, List[str]] = {}
+
+    for _, r in df.iterrows():
+        d = r.get("deadline")
+        if not isinstance(d, date):
+            continue
+        label = f"[P{int(r.get('priority', 99))}] {r.get('project','')} — {r.get('task','')}".strip()
+        out.setdefault(d, []).append(label)
+
+    # option: trie par priorité (déjà dans le texte, mais on trie quand même)
+    for k in out:
+        out[k] = sorted(out[k])
+    return out
+
+ZONE_A_ICS_URL = "https://fr.ftp.opendatasoft.com/openscol/fr-en-calendrier-scolaire/Zone-A.ics"
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def fetch_zone_a_ics() -> str:
+    r = requests.get(ZONE_A_ICS_URL, timeout=30, verify=False)
+    r.raise_for_status()
+    return r.text
+
+
+def _parse_ics_date(line: str) -> Optional[date]:
+    # DTSTART;VALUE=DATE:20260801  or DTSTART:20260801T000000Z
+    if ":" not in line:
+        return None
+    v = line.split(":", 1)[1].strip()
+    if len(v) >= 8 and v[:8].isdigit():
+        y, m, d = int(v[:4]), int(v[4:6]), int(v[6:8])
+        return date(y, m, d)
+    return None
+
+
+def zone_a_school_holidays_dates(window_start: date, window_end: date) -> Set[date]:
+    """
+    Retourne les dates (jours) couvertes par les événements "Vacances ..." de Zone A,
+    intersectées avec [window_start, window_end].
+    """
+    ics = fetch_zone_a_ics()
+
+    in_event = False
+    dtstart: Optional[date] = None
+    dtend: Optional[date] = None
+    summary: str = ""
+
+    out: Set[date] = set()
+
+    for raw in ics.splitlines():
+        line = raw.strip()
+
+        if line == "BEGIN:VEVENT":
+            in_event = True
+            dtstart = None
+            dtend = None
+            summary = ""
+            continue
+
+        if line == "END:VEVENT":
+            if in_event and dtstart and dtend:
+                # On garde uniquement les événements "Vacances ..."
+                if summary.lower().startswith("vacances"):
+                    # En iCal, DTEND est souvent exclusif pour les dates all-day
+                    start = max(dtstart, window_start)
+                    end_excl = min(dtend, window_end + timedelta(days=1))
+                    d = start
+                    while d < end_excl:
+                        out.add(d)
+                        d += timedelta(days=1)
+            in_event = False
+            continue
+
+        if not in_event:
+            continue
+
+        if line.startswith("DTSTART"):
+            dtstart = _parse_ics_date(line)
+        elif line.startswith("DTEND"):
+            dtend = _parse_ics_date(line)
+        elif line.startswith("SUMMARY"):
+            # SUMMARY:Vacances de la Toussaint
+            summary = line.split(":", 1)[1].strip() if ":" in line else ""
+
+    return out
+
+def build_label_color_map(holidays_df: pd.DataFrame) -> Dict[str, str]:
+    if holidays_df is None or holidays_df.empty or "label" not in holidays_df.columns:
+        return {}
+
+    labels = (
+        holidays_df["label"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .replace("", "OFF")
+        .unique()
+        .tolist()
+    )
+
+    palette = px.colors.qualitative.Plotly
+
+    def pick_color(label: str) -> str:
+        h = hashlib.md5(label.encode("utf-8")).hexdigest()
+        idx = int(h[:8], 16) % len(palette)
+        return palette[idx]
+
+    return {lab: pick_color(lab) for lab in sorted(labels)}
+
+
+def render_rolling_absence_calendar_html(
+    holidays_df: pd.DataFrame,
+    start_month: date,
+    label_colors: Dict[str, str],
+    months: int = 12,
+    school_days: Optional[Set[date]] = None,
+    deadlines_map: Optional[Dict[date, List[str]]] = None,
+) -> str:
+    # map: date -> { "AM": label, "PM": label }
+    m: Dict[date, Dict[str, str]] = {}
+    if holidays_df is not None and not holidays_df.empty:
+        for _, r in holidays_df.iterrows():
+            d = r.get("date")
+            slot_raw = r.get("slot", "")
+            slot = str(slot_raw).strip().upper()
+            label = str(r.get("label", "")).strip() or "OFF"
+
+            if isinstance(d, date):
+                day_map = m.setdefault(d, {})
+
+                # ✅ slot vide = journée complète
+                if slot == "" or pd.isna(slot_raw):
+                    day_map["AM"] = label
+                    day_map["PM"] = label
+
+                # demi-journée explicite
+                elif slot in ("AM", "PM"):
+                    day_map[slot] = label
+
+    cal = calendar.Calendar(firstweekday=0)  # lundi
+
+    def badge(kind: str, label: str) -> str:
+        safe = (label or "OFF").replace("<", "&lt;").replace(">", "&gt;")
+        color = label_colors.get(label or "OFF", "#444")
+        return f"""
+        <div class="mpw-badge" style="
+            background:{color};
+            border:1px solid {color};
+            color:#fff;
+        ">
+            <span class="mpw-slot">{kind}</span>
+            <span class="mpw-sep">—</span>
+            <span class="mpw-label">{safe}</span>
+        </div>
+        """
+
+    header = "".join(f"<th>{w}</th>" for w in ["Lun", "Mar", "Mer", "Jeu", "Ven"])
+
+    months_html: List[str] = []
+
+    # 🔁 boucle sur 12 mois glissants
+    for i in range(months):
+        y = (start_month.year + (start_month.month - 1 + i) // 12)
+        mth = ((start_month.month - 1 + i) % 12) + 1
+
+        month_name = calendar.month_name[mth]
+        weeks = cal.monthdayscalendar(y, mth)
+
+        rows: List[str] = []
+        for week in weeks:
+            week_5 = week[:5]  # Lun..Ven
+            if all(dn == 0 for dn in week_5):
+                continue
+
+            tds: List[str] = []
+            for daynum in week_5:
+                if daynum == 0:
+                    tds.append("<td class='mpw-empty'></td>")
+                    continue
+
+                d = date(y, mth, daynum)
+                day_slots = m.get(d, {})
+                am = day_slots.get("AM")
+                pm = day_slots.get("PM")
+
+                # ✅ Deadline marker
+                dl = (deadlines_map or {}).get(d, [])
+                if dl:
+                    tooltip = "&#10;".join([x.replace("<","&lt;").replace(">","&gt;") for x in dl])
+                    marker = f"<span class='mpw-deadline' title='{tooltip}'>🎯</span>"
+                else:
+                    marker = ""
+                cell_parts = [f"<div class='mpw-daynum'>{daynum}{marker}</div>"]
+
+                if am and pm and am == pm:
+                    cell_parts.append(badge("Journée", am))
+                    td_cls = "mpw-day mpw-full"
+                else:
+                    if am:
+                        cell_parts.append(badge("AM", am))
+                    if pm:
+                        cell_parts.append(badge("PM", pm))
+                    td_cls = "mpw-day"
+                
+                is_school_holiday = (school_days is not None and d in school_days)
+                # classe de fond bleu clair
+                extra_cls = " mpw-school" if is_school_holiday else ""
+                td_cls = td_cls + extra_cls
+
+
+                tds.append(f"<td class='{td_cls}'>" + "".join(cell_parts) + "</td>")
+
+            rows.append("<tr>" + "".join(tds) + "</tr>")
+
+        months_html.append(
+            f"""
+            <div class="mpw-month">
+              <div class="mpw-month-title">{month_name} {y}</div>
+              <table class="mpw-cal mpw-cal-5">
+                <thead><tr>{header}</tr></thead>
+                <tbody>
+                  {''.join(rows)}
+                </tbody>
+              </table>
+            </div>
+            """
+        )
+
+    # CSS identique à avant
+    style = """
+    <style>
+      .mpw-school{
+        background: #e8f2ff !important;   /* bleu clair */
+        border: 1px solid #cfe4ff !important;
+      }
+      .mpw-grid{
+        display:grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 14px;
+      }
+      @media (max-width: 1100px){
+        .mpw-grid{ grid-template-columns: repeat(2, 1fr); }
+      }
+      @media (max-width: 700px){
+        .mpw-grid{ grid-template-columns: 1fr; }
+      }
+      .mpw-month{
+        border: 1px solid #e6e6e6;
+        border-radius: 12px;
+        padding: 10px;
+        background: white;
+      }
+      .mpw-month-title{
+        font-weight: 800;
+        margin: 2px 4px 8px;
+        font-size: 14px;
+      }
+      table.mpw-cal{
+        width: 100%;
+        table-layout: fixed;
+        border-collapse: separate;
+        border-spacing: 6px;
+      }
+      .mpw-cal th{
+        font-size: 11px;
+        color: #666;
+        font-weight: 700;
+        text-align: center;
+      }
+      .mpw-cal td{
+        vertical-align: top;
+        height: 40px;       /* ⬅️ plus compact */
+        border-radius: 8px;
+        background: #fafafa;
+        padding: 3px;       /* ⬅️ moins de padding */
+      }
+      .mpw-daynum{
+        display:flex;
+        align-items:center;
+        gap:6px;
+        font-weight: 900;
+        font-size: 11px;
+        margin-bottom: 1px;
+        line-height: 1;
+      }
+      .mpw-deadline{
+        font-size: 12px;
+        cursor: help;
+        opacity: 0.95;
+        filter: saturate(1.2); 
+      }
+      .mpw-badge{
+        font-size: 9.5px;   /* ⬅️ un poil plus petit */
+        padding: 2px 6px;
+        border-radius: 999px;
+        margin-top: 1px;    /* ⬅️ colle le badge */
+        font-weight: 900;
+        line-height: 1.0;
+      }
+      .mpw-empty{ background: transparent !important; }
+      .mpw-full{
+        background: #f0f0f0;
+        border: 1px solid #e2e2e2;
+      }
+    </style>
+    """
+
+    return style + f"<div class='mpw-grid'>{''.join(months_html)}</div>"
+
+
+# ============================================================
+# Colors + HTML helpers (planning tasks)
+# ============================================================
+
 def load_project_colors_from_cfg(cfg: pd.DataFrame) -> Dict[str, str]:
     s = str(cfg.loc[0, "project_colors"]) if "project_colors" in cfg.columns else ""
     if not s.strip():
@@ -336,6 +676,7 @@ def build_holidays_map(holidays_df: pd.DataFrame) -> Dict[str, str]:
 # ============================================================
 # Scheduling engine (macro)
 # ============================================================
+
 @dataclass(frozen=True)
 class Slot:
     day: date
@@ -359,11 +700,24 @@ def build_blocked_slots(holidays_df: pd.DataFrame) -> Set[str]:
     blocked = set()
     if holidays_df is None or holidays_df.empty:
         return blocked
+
     for _, r in holidays_df.iterrows():
-        d = r["date"]
-        s = str(r["slot"]).upper()
-        if isinstance(d, date) and s in ("AM", "PM"):
-            blocked.add(f"{d.isoformat()} {s}")
+        d = r.get("date")
+        slot_raw = r.get("slot", "")
+        slot = str(slot_raw).strip().upper()
+
+        if not isinstance(d, date):
+            continue
+
+        # ✅ slot vide = journée complète
+        if slot == "" or pd.isna(slot_raw):
+            blocked.add(f"{d.isoformat()} AM")
+            blocked.add(f"{d.isoformat()} PM")
+
+        # demi-journée explicite
+        elif slot in ("AM", "PM"):
+            blocked.add(f"{d.isoformat()} {slot}")
+
     return blocked
 
 
@@ -570,47 +924,33 @@ def make_week_grid_html(
     return pd.DataFrame(rows)
 
 
+def auto_height(df, row_height=35, max_height=600):
+    return min(max_height, (len(df) + 1) * row_height)
+
+
 # ============================================================
 # Streamlit UI
 # ============================================================
+
 st.set_page_config(page_title="Mini-Planyway", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(
     """
     <style>
-    /* 🔽 Réduit l’espace vide au-dessus du contenu */
-    .block-container {
-        padding-top: 1.2rem !important;
-    }
-
-    /* 🔽 Réduit l’espace entre le titre et le reste */
-    h1 {
-        margin-bottom: 0.3rem !important;
-    }
-
-    /* 🔽 Cache la top bar (Deploy, menu ⋮) */
-    header {
-        visibility: hidden;
-        height: 0px;
-    }
-
-    /* 🔽 Supprime l’espace réservé par la top bar */
-    [data-testid="stToolbar"] {
-        display: none;
-    }
+    .block-container { padding-top: 1.2rem !important; }
+    h1 { margin-bottom: 0.3rem !important; }
+    header { visibility: hidden; height: 0px; }
+    [data-testid="stToolbar"] { display: none; }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
-
 
 st.title("🗓️ Mini planification équipe")
 
-# Endpoint check
 if not PA_ENDPOINT:
     st.error("PA_ENDPOINT manquant.")
     st.stop()
 
-# ---- Fetch excel (d'abord), puis on affiche les contrôles 1 seule fois
 try:
     xlsx_bytes = fetch_excel_from_power_automate(PA_ENDPOINT)
     xls = open_xls_bytes(xlsx_bytes)
@@ -623,14 +963,12 @@ except Exception as e:
     )
     st.stop()
 
-# config + people
 cfg = normalize_config(read_sheet(xls, SHEET_CONFIG))
 people = get_people(cfg, xls)
 if not people:
     st.error("Aucune personne détectée. Renseigne Config.people='Alice,Bob' ou crée des onglets prénom.")
     st.stop()
 
-# session person init
 if "person" not in st.session_state or st.session_state["person"] not in people:
     st.session_state["person"] = people[0]
 
@@ -654,15 +992,12 @@ with st.expander("⚙️ Contrôles", expanded=True):
 
 person = st.session_state["person"]
 
-# Load person sheets
 tasks = normalize_tasks(read_sheet(xls, person))
 holidays = normalize_holidays(read_sheet(xls, f"{person}{HOL_SUFFIX}"))
 
-# Colors map (from config)
 existing_colors = load_project_colors_from_cfg(cfg)
 project_color_map = ensure_project_color_map(tasks, existing_colors)
 
-# Macro params from Config only
 workdays = parse_workdays(cfg.loc[0, "workdays"]) or (0, 1, 2, 3, 4)
 smooth_max_slots_per_day = int(cfg.loc[0, "smooth_max_slots_per_day"]) if "smooth_max_slots_per_day" in cfg.columns else 1
 smooth_weekdays_default = parse_workdays(cfg.loc[0, "smooth_weekdays_default"]) or workdays
@@ -672,7 +1007,6 @@ start_from_str = str(cfg.loc[0, "start_from"]) if "start_from" in cfg.columns el
 start_from = normalize_date(start_from_str) if start_from_str.strip() else None
 start_from = start_from or date.today()
 
-# Compute plan
 plan_df, planned_tasks = schedule_macro_halfday(
     tasks,
     workdays=tuple(workdays),
@@ -688,7 +1022,7 @@ tab_tasks, tab_holidays, tab_week, tab_gantt = st.tabs(
 )
 
 # --------------------------
-# Tasks tab (read-only) + filters
+# Tasks tab
 # --------------------------
 with tab_tasks:
     st.subheader(f"Tâches — {person}")
@@ -743,27 +1077,50 @@ with tab_tasks:
         )
         tasks_view = tasks_view[mask]
 
+    tasks_sorted = tasks_view.sort_values(
+        ["priority", "deadline", "id"],
+        ascending=[True, True, True],
+        na_position="last",
+    )
+
     st.dataframe(
-        tasks_view.sort_values(
-            ["priority", "deadline", "id"],
-            ascending=[True, True, True],
-            na_position="last",
-        ),
+        tasks_sorted,
         use_container_width=True,
         hide_index=True,
+        height=auto_height(tasks_sorted),
     )
 
 # --------------------------
-# Holidays tab (read-only)
+# Holidays tab (annual calendar, label written inside cells)
 # --------------------------
 with tab_holidays:
     st.subheader(f"Congés / Formations — {person}")
 
-    st.dataframe(
-        holidays if not holidays.empty else pd.DataFrame(columns=["date", "slot", "label"]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    if holidays.empty:
+        st.info("Aucune absence.")
+    else:
+        label_colors = build_label_color_map(holidays)
+
+        start_month = date.today().replace(day=1)
+        months = 12
+        window_start = start_month
+        # fin de fenêtre = dernier jour du mois (start_month + 12 mois - 1 jour)
+        end_y = (start_month.year + (start_month.month - 1 + months) // 12)
+        end_m = ((start_month.month - 1 + months) % 12) + 1
+        window_end = date(end_y, end_m, 1) - timedelta(days=1)
+        school_days = zone_a_school_holidays_dates(window_start, window_end)
+        deadlines_map = build_deadlines_map(tasks, only_todo=True)
+
+        html = render_rolling_absence_calendar_html(
+            holidays_df=holidays,
+            start_month=start_month,
+            label_colors=label_colors,
+            months=months,
+            school_days=school_days,
+            deadlines_map=deadlines_map,
+        )
+
+        components.html(html, height=1850, scrolling=True)
 
 # --------------------------
 # Week view
@@ -784,6 +1141,7 @@ with tab_week:
 
         st.markdown("### Grille hebdo")
         weeks_to_show = st.slider("Nb de semaines à afficher (grille)", 4, 16, 8, 1)
+
         show_cols = ["Semaine"]
         for wd in range(7):
             if wd in workdays:
@@ -832,9 +1190,19 @@ with tab_week:
         else:
             hol_df = hol_df.dropna(subset=["date"]).drop_duplicates(subset=["date", "slot"]).copy()
             hol_df = hol_df[hol_df["date"].apply(lambda d: isinstance(d, date) and d.weekday() in workdays)]
+
             hol_df["week_start"] = hol_df["date"].apply(iso_week_start)
             hol_df["week"] = hol_df["week_start"].apply(lambda d: f"{d.isocalendar().year}-W{d.isocalendar().week:02d}")
-            w_hol = hol_df.groupby(["week_start", "week"], as_index=False).size().rename(columns={"size": "slots"})
+
+            # ✅ slot vide = journée complète = 2 demi-journées
+            hol_df["slot_norm"] = hol_df["slot"].fillna("").astype(str).str.strip().str.upper()
+            hol_df["slots_weight"] = hol_df["slot_norm"].apply(lambda s: 2 if s == "" else 1)
+
+            w_hol = (
+                hol_df.groupby(["week_start", "week"], as_index=False)["slots_weight"]
+                .sum()
+                .rename(columns={"slots_weight": "slots"})
+            )
             w_hol["series"] = HOLIDAY_SERIES_NAME
 
         w = pd.concat(
@@ -889,10 +1257,18 @@ with tab_week:
             "deadline",
             "late",
         ]
+
+        out_sorted = out[show].sort_values(
+            ["priority", "deadline", "id"],
+            ascending=[True, True, True],
+            na_position="last",
+        )
+
         st.dataframe(
-            out[show].sort_values(["priority", "deadline", "id"], ascending=[True, True, True], na_position="last"),
+            out_sorted,
             use_container_width=True,
             hide_index=True,
+            height=auto_height(out_sorted),
         )
 
 # --------------------------
