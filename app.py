@@ -661,17 +661,34 @@ def holiday_cell_html(label: str) -> str:
 
 
 def build_holidays_map(holidays_df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Map pour la vue hebdo:
+    - slot "AM" / "PM" -> met la case correspondante
+    - slot vide -> journée complète -> met AM + PM
+    """
     m: Dict[str, str] = {}
     if holidays_df is None or holidays_df.empty:
         return m
+
     for _, r in holidays_df.iterrows():
         d = r.get("date")
-        slot = str(r.get("slot", "")).upper()
+        slot_raw = r.get("slot", "")
+        slot = str(slot_raw).strip().upper()
         label = str(r.get("label", "")).strip() or "OFF"
-        if isinstance(d, date) and slot in ("AM", "PM"):
-            m[f"{d.isoformat()} {slot}"] = label
-    return m
 
+        if not isinstance(d, date):
+            continue
+
+        # ✅ slot vide = journée complète
+        if slot == "" or pd.isna(slot_raw):
+            m[f"{d.isoformat()} AM"] = label
+            m[f"{d.isoformat()} PM"] = label
+
+        # demi-journée explicite
+        elif slot in ("AM", "PM"):
+            m[f"{d.isoformat()} {slot}"] = label
+
+    return m
 
 # ============================================================
 # Scheduling engine (macro)
@@ -1017,8 +1034,8 @@ plan_df, planned_tasks = schedule_macro_halfday(
     focus_only_day=bool(focus_only_day),
 )
 
-tab_tasks, tab_holidays, tab_week, tab_gantt = st.tabs(
-    ["🧾 Tâches", "🏖️ Absence", "🗂️ Vue hebdo", "📈 Gantt macro"]
+tab_tasks, tab_holidays, tab_week, tab_gantt, tab_guide = st.tabs(
+    ["🧾 Tâches", "🏖️ Absence", "🗂️ Vue hebdo", "📈 Gantt macro", "📘 Guide"]
 )
 
 # --------------------------
@@ -1264,12 +1281,18 @@ with tab_week:
             na_position="last",
         )
 
+        styled = out_sorted.style.apply(
+            lambda row: ["background-color: #ffd6d6" if bool(row.get("late")) else "" for _ in row],
+            axis=1,
+        )
+
         st.dataframe(
-            out_sorted,
+            styled,
             use_container_width=True,
             hide_index=True,
             height=auto_height(out_sorted),
         )
+
 
 # --------------------------
 # Gantt
@@ -1285,6 +1308,11 @@ with tab_gantt:
         g = g.dropna(subset=["Start", "Finish"]).copy()
         g["Label"] = g.apply(lambda r: f"[P{int(r['priority'])}] {r['project']} — {r['task']}", axis=1)
 
+        # ✅ deadlines associées
+        deadline_map = tasks.set_index("id")["deadline"].to_dict()
+        g["Deadline"] = g["id"].map(deadline_map)
+        g["Deadline"] = pd.to_datetime(g["Deadline"], errors="coerce")
+
         fig = px.timeline(
             g.sort_values(["priority", "Start"]),
             x_start="Start",
@@ -1295,5 +1323,113 @@ with tab_gantt:
             hover_data=["id", "project", "priority", "est_halfdays", "mode", "focus_weekday"],
         )
         fig.update_yaxes(autorange="reversed")
+        today = date.today()
+
+        fig.add_vrect(
+            x0=today,
+            x1=today + timedelta(days=1),  # ✅ OK
+            fillcolor="red",
+            opacity=0.5,
+            line_width=0,
+        )
+
+        # ✅ Ajout des "targets" (🎯) aux deadlines
+        dl = g.dropna(subset=["Deadline"]).copy()
+        if not dl.empty:
+            # on place le marker sur la même ligne y="Label"
+            fig.add_trace(
+                px.scatter(
+                    dl,
+                    x="Deadline",
+                    y="Label",
+                    hover_data=["id", "project", "task", "priority"],
+                ).update_traces(
+                    mode="markers+text",
+                    text=["🎯"] * len(dl),
+                    textposition="middle right",
+                    marker=dict(size=8, symbol="circle"),
+                    name="Deadline",
+                ).data[0]
+            )
+
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Macro: les barres viennent des slots AM/PM planifiés (pas d’heures).")
+        st.caption("Macro: barres = slots AM/PM planifiés. 🎯 = deadline de la tâche.")
+
+# --------------------------
+# Guide (help)
+# --------------------------
+with tab_guide:
+    st.subheader("📘 Guide — Remplir le fichier Excel")
+
+    st.markdown(
+        """
+### 🎯 À quoi ça sert ?
+Ce fichier Excel permet de **générer automatiquement un planning** (en demi-journées) par personne :
+- tri par **priorité** puis **deadline**
+- prise en compte des **absences**
+- affichage **calendrier absences**, **deadlines 🎯**, **vue hebdo** et **Gantt**
+
+---
+
+### 🗂️ Onglets du fichier
+- **Config** : paramètres globaux (jours travaillés, date de départ…). ⚠️ à modifier avec précaution  
+- **{Prénom}** : tâches de la personne (1 ligne = 1 tâche)  
+- **{Prénom}_absence** : absences (congés/RTT/formation/férié…)
+
+---
+
+### 🧾 Colonnes essentielles — Onglet Tâches
+- **project** : nom du projet (sert aux couleurs + regroupement)
+- **task** : description courte
+- **priority** : 1 = très prioritaire (plus petit = planifié plus tôt)
+- **est_halfdays** : charge en demi-journées (2 = 1 jour)
+- **status** : Todo / Done (Done = ignoré)
+- **deadline** : date cible (affichée avec 🎯 dans le calendrier)
+- **start_date** : pas avant cette date
+- **mode** :
+  - **SMOOTH** (défaut) : lissage
+  - **FOCUS** : uniquement un jour fixe
+- **focus_weekday** : jour de semaine si FOCUS (1=Lun … 7=Dim)
+- **smooth_weekdays** : jours autorisés (optionnel, même format)
+- **notes** : texte libre
+
+---
+
+### 🏖️ Onglet Absence : règles
+- **date** : date d’absence
+- **slot** :
+  - **AM** = matin
+  - **PM** = après-midi
+  - **vide** = **journée complète** ✅ (AM + PM = 2 slots)
+- **label** : CA / RTT / Formation / Férié / etc. (affiché dans le calendrier)
+
+---
+
+### ✅ Bonnes pratiques
+- Estimer **réaliste** (en demi-journées)
+- Mettre **Done** dès que terminé
+- Laisser vide si doute (règles par défaut)
+
+💡 En cas de problème de rendu, vérifier : dates valides, priorité numérique, `slot` = AM/PM/vide.
+"""
+    )
+
+    with st.expander("📌 Exemples rapides", expanded=False):
+        st.markdown(
+            """
+**Tâche**
+- project = `Client X`
+- task = `Préparer CR atelier`
+- priority = `1`
+- est_halfdays = `2`
+- status = `Todo`
+- deadline = `2026-02-20`
+- mode = `SMOOTH`
+
+**Absence**
+- date = `2026-08-04`
+- slot = *(vide)*
+- label = `CA`
+➡️ bloque **toute la journée**
+"""
+        )
