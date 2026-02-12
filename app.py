@@ -14,6 +14,9 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
+if st.query_params.get("ping") == "1":
+    st.write("ok")
+    st.stop()
 
 # ============================================================
 # ✅ Mini-Planyway macro (TEAM / SharePoint via Power Automate)
